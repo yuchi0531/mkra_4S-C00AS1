@@ -25,7 +25,7 @@ SHARP 4S-C00AS1をMirakurun互換のネットワークチューナーとして�
 ## ビルドと起動
 
 ```sh
-git clone https://github.com/AkaakuHub/mkra_4S-C00AS1.git
+git clone https://github.com/yuchi0531/mkra_4S-C00AS1.git
 cd mkra_4S-C00AS1
 rustup target add armv7-unknown-linux-musleabihf
 ./tools/build_unified.sh
@@ -33,7 +33,21 @@ rustup target add armv7-unknown-linux-musleabihf
 
 生成した`target/armv7-unknown-linux-musleabihf/release/mkra`を本体の`/tmp/mt/mkra`へ転送し、実行権限を付けます。録画中の入れ替えや既存サーバーとの二重起動を避けてください。
 
+telnetだけが使える状態なら、母艦から配置・起動・2K実測まで自動で行えます。
+
 ```sh
+# 転送のみ
+python3 tools/deploy.py --host 192.168.1.154
+# 通常BSを実際に取り出して検証する（本体の選局が変わり、HDMIは戻らないことがあります）
+python3 tools/deploy.py --host 192.168.1.154 --smoke-2k 400151 --serve
+```
+
+`--smoke-2k`は純正バイナリのMD5照合、局表の転送、選局、188バイト同期率・CCエラー・`ffprobe`でのデコードまで確認します。
+
+本体管理shellで直接起動する場合:
+
+```sh
+chmod 755 /tmp/mt/mkra
 /tmp/mt/mkra serve --remux4k --tune --bs2k --channel-type BS4K --port 40772
 ```
 

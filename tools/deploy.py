@@ -9,6 +9,12 @@ product process.
     python3 tools/deploy.py --host 198.51.100.10 --smoke         # + prove it streams
     python3 tools/deploy.py --host 198.51.100.10 --smoke --serve # + leave it running
     python3 tools/deploy.py --host 198.51.100.10 --stop          # stop our server
+    python3 tools/deploy.py --host 198.51.100.10 --bs2k --serve  # conventional BS/CS
+    python3 tools/deploy.py --host 198.51.100.10 --smoke-2k 400151  # prove 2K
+
+--smoke-2k uploads config/bs-additional-main.tsv, verifies the OEM hashes the
+2K graph requires, retunes the box to that service, and checks the captured TS
+here. It changes what the TV is showing; run it when nobody is watching.
 
 --smoke captures ten seconds of live 4K on the box, pulls it back over HTTP and
 checks the 188-byte framing here. If `ffprobe` is installed it also decodes a
@@ -144,6 +150,112 @@ def pull(t, host, remote_path, local_path, port):
     return got
 
 
+OEM_FILES = [
+    ("/usr/bin/tuner", "b94fc6a8f2e506dc66336c5d0d031b69"),
+    ("/usr/bin/abs", "1a3fdfa8379d75a802190b48ea951e9a"),
+    ("/disk/xc6drv/xcdrv.ko", "0bfa0f7db130e058f3ec838bbd681b7d"),
+    ("/usr/vixs/lib/libvixs.so", "344f0ef7b1a84d49ae13659d3a388d78"),
+]
+
+
+def check_identity(t):
+    """The 2K graph refuses to run unless the OEM userland is the exact build
+    the ABI was measured on. Check it here so the failure is one clear line
+    instead of a stream that never starts."""
+    bad = 0
+    for path, want in OEM_FILES:
+        got = t.run("md5sum %s 2>/dev/null" % path).split()
+        if not got or got[0] != want:
+            print("  IDENTITY MISMATCH %s: %s (expected %s)"
+                  % (path, got[0] if got else "missing", want))
+            bad += 1
+    if not bad:
+        print("  OEM identity: all %d hashes match" % len(OEM_FILES))
+    return bad == 0
+
+
+def upload_table(t, source):
+    remote = MICROTEST_DIR + "/bs-additional-main.tsv"
+    size = os.path.getsize(source)
+    print("uploading %s (%d bytes) -> %s" % (os.path.basename(source), size, remote))
+    md5 = t.upload(source, remote)
+    print("  md5 %s verified on device" % md5)
+    return remote
+
+
+def smoke_2k(t, host, service_id, seconds, port, tsv):
+    """Capture a conventional BS/CS service through the API.
+
+    This is the check that actually proves 2K: an HTTP 200 alone does not, and
+    neither does a decoded frame from a 4K remux. Measure TS framing, CC, and
+    decode the result here.
+    """
+    print("\n--- capturing %d s of service %d (satellite retune) ---"
+          % (seconds, service_id))
+    cmd = ("%s serve --remux4k --tune --bs2k --channel-type BS4K --port %d "
+           "--isdbs-channels %s --epg-tap --epg-refresh 5 --epg-dir /tmp/adsb "
+           "> %s/mkra-2k.log 2>&1 & echo $!"
+           % (REMOTE, port, tsv, MICROTEST_DIR))
+    pid = t.run(cmd).strip()
+    try:
+        up = False
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                with urllib.request.urlopen(
+                        "http://%s:%d/api/version" % (host, port), timeout=3) as r:
+                    if r.status == 200:
+                        up = True
+                        break
+            except Exception:
+                pass
+        if not up:
+            print("server did not come up:\n" + t.run("tail -20 %s/mkra-2k.log"
+                                                    % MICROTEST_DIR))
+            return False
+
+        with urllib.request.urlopen("http://%s:%d/api/services" % (host, port),
+                                    timeout=10) as r:
+            services = json.load(r)
+        if not any(s.get("id") == service_id for s in services):
+            print("service %d is not advertised; the channel table did not load"
+                  % service_id)
+            print("advertised: %s" % ", ".join(
+                "%d (%s)" % (s.get("id"), s.get("name")) for s in services[:20]))
+            return False
+
+        local = os.path.join(ROOT, "smoke-2k.ts")
+        url = "http://%s:%d/api/services/%d/stream" % (host, port, service_id)
+        deadline = time.time() + seconds + 45
+        got = 0
+        with open(local, "wb") as fh:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                while time.time() < deadline and got < seconds * 400_000:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    got += len(chunk)
+        print("  pulled %d bytes -> %s" % (os.path.getsize(local), local))
+        print("  " + ts_report(local))
+        try:
+            p = subprocess.run(["ffprobe", "-hide_banner", "-v", "error",
+                                "-show_entries",
+                                "stream=codec_name,width,height,sample_rate",
+                                "-of", "default=noprint_wrappers=1", local],
+                               capture_output=True, text=True, timeout=60)
+            if p.stdout.strip():
+                print("  ffprobe: " + " ".join(p.stdout.split()))
+            else:
+                print("  ffprobe found no decodable stream")
+                return False
+        except FileNotFoundError:
+            print("  (install ffmpeg to decode-check %s)" % local)
+        return os.path.getsize(local) > 188 * 100
+    finally:
+        t.stop_microtest(pid)
+
+
 def smoke(t, host, seconds, port):
     print("\n--- 1/3  live graph (read-only) ---")
     graph = t.run("%s graph --sniff" % REMOTE, timeout=120)
@@ -199,6 +311,15 @@ def main():
                          "BonDriver_Mirakurun (default BS4K)")
     ap.add_argument("--no-tune", action="store_true",
                     help="do not let mkra change the box's channel")
+    ap.add_argument("--bs2k", action="store_true",
+                    help="also upload config/bs-additional-main.tsv and start "
+                         "the server with --bs2k (conventional BS; CS works "
+                         "only for rows you put in the table)")
+    ap.add_argument("--smoke-2k", type=int, metavar="SERVICE",
+                    help="capture SERVICE (e.g. 400151) live for --smoke-seconds "
+                         "and verify it; implies --bs2k and retunes the box")
+    ap.add_argument("--keep-2k-server", action="store_true",
+                    help="with --smoke-2k, leave the server those args started")
     ap.add_argument("--stop", action="store_true",
                     help="just stop a running mkra and exit")
     ap.add_argument("--pull-port", type=int, default=40790,
@@ -220,6 +341,15 @@ def main():
         t.make_microtest_dir()
         upload(t, a.binary)
 
+        tsv = None
+        if a.bs2k or a.smoke_2k:
+            if not check_identity(t):
+                print("\nThe 2K graph refuses unverified OEM binaries; this box "
+                      "does not match the measured ABI. Stop here.")
+                return 1
+            tsv = upload_table(t, os.path.join(ROOT, "config",
+                                               "bs-additional-main.tsv"))
+
         if not operating:
             print("\nThe box is in standby, so there is nothing to capture yet.\n"
                   "Press the power button (LED green), then re-run with --smoke.")
@@ -229,10 +359,19 @@ def main():
         if a.smoke:
             ok = smoke(t, a.host, a.smoke_seconds, a.pull_port)
 
+        if a.smoke_2k:
+            ok = smoke_2k(t, a.host, a.smoke_2k, a.smoke_seconds,
+                          a.serve_port, tsv) and ok
+            if not a.keep_2k_server:
+                stop_ours(t)
+
         if a.serve:
-            cmd = ("%s serve --remux4k %s --channel-type %s --port %d "
+            extra = ""
+            if tsv:
+                extra = " --bs2k --isdbs-channels %s" % tsv
+            cmd = ("%s serve --remux4k %s%s --channel-type %s --port %d "
                    "--epg-dir /tmp/adsb > %s/mkra.log 2>&1 &"
-                   % (REMOTE, "" if a.no_tune else "--tune",
+                   % (REMOTE, "" if a.no_tune else "--tune", extra,
                       a.channel_type, a.serve_port, MICROTEST_DIR))
             t.run(cmd)
             time.sleep(2)
@@ -243,7 +382,7 @@ def main():
             print("Point TVTest / EPGStation at http://%s:%d"
                   % (a.host, a.serve_port))
 
-        if a.smoke and not ok:
+        if (a.smoke or a.smoke_2k) and not ok:
             return 1
         return 0
     finally:

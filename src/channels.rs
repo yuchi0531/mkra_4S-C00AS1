@@ -445,4 +445,15 @@ mod unified_tests {
         assert!(t.add_isdbs_tsv(cs).is_err());
         assert!(t.add_isdbs_tsv(&cs.replace("12291000","1")).is_err());
     }
+
+    /// The shipped BS table is what docs/SETUP.md tells people to upload, so a
+    /// column mismatch here would fail the documented install, not just a test.
+    #[test]
+    fn shipped_bs_additional_table_parses() {
+        let mut t = ChannelTable::default();
+        t.add_isdbs_tsv(include_str!("../config/bs-additional-main.tsv")).unwrap();
+        assert_eq!(t.channels.len(), 5);
+        assert!(t.find("BS", "BS_TS40D0").is_some());
+        assert!(t.find_service(400161).is_some());
+    }
 }
