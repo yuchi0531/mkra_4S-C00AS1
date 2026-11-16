@@ -1,7 +1,5 @@
 # 通常BSの受信経路
 
-2026-10-16の実機検証を基にした公開用資料。純正コードやダンプは含まない。
-
 ## 結論
 
 SC1501AのISDB-SロックだけではTS取得にならない。復調出力、SoC入力割当、DEMUXの論理ポート、ring/readerを一致させる必要があった。
@@ -17,17 +15,11 @@ SC1501AのISDB-SロックだけではTS取得にならない。復調出力、So
 5. PID=-1でSYSTEM/TS、PID0ではDATA/PSI_SECTIONを読める。
 6. size=0のdescriptorもreader commitして返却する。自分が生成したring/readerだけを解放し、純正所有物に触れない。
 
-入力クロスバーMMR0x61f0はidentity0x10→0x00へ変化。復帰時には保存した設定へ戻す。4K診断REMUXが取れてもHDMIの純正デコーダが戻るとは限らない。
+入力クロスバーMMR0x61f0はidentity0x10→0x00へ変化する。開始時にすでに0x00の場合も保存し、同じlogical1→physical0の設定を重ねて送らない。復帰時には保存した0x00または0x10の接続先に対応する物理設定を使い、3つの設定MMRとクロスバーが保存値へ戻ったことを照合する。それ以外のクロスバー値は拒否する。4K診断REMUXが取れてもHDMIの純正デコーダが戻るとは限らない。
 
 実装: `src/bs2k.rs`、`src/loopback.rs`、`src/xcdrv.rs`、`src/tuner.rs`、`src/gr_i2c.rs`。
 
-## 独立した受信確認
-
-BS朝日の15秒取得は32,932,148バイト、175,171パケット、約17.56Mbps。全188バイト同期、TEI0、非null PIDのCC異常0、完結PSI/SI1,690セクションのCRC不一致0。PATのTSID0x4010とサービス151/152/153、MPEG-2 PID0x140 / AAC PID0x141を確認した。
-
-別TSのEITが見えることだけを、その局を選局して受信できた証拠とはしない。後に6局を個別選局し、映像音声のデコードで確認した。
-
-## 6局設定
+## 局設定
 
 BS朝日は内蔵設定。追加5局は`config/bs-additional-main.tsv`。TSIDは16進表記、周波数はkHz。NHK BSは受信波から確認したTSID0x40F1を使う。古い局表の値を流用しない。
 

@@ -31,8 +31,8 @@ python3 -m compileall -q tools/epgstation
 
 ## 動作範囲
 
-開発時のEPGStation2.10.0での実測と、公開用EOF処理/新規配布unitのホスト試験を区別する。公開初版のEOFはcache終了時刻snapshotで、延長追従ではない。今回の配布設定を稼働中の実機へ適用していない。
+番組ID配信の終了はキャッシュの終了時刻に基づき、番組延長への継続追従には対応しません。
 
 `fix-transition-playback.py`は特定2.10.0構成向けの任意パッチで、設定/TS/distをbackupし、想定外なら停止する。`verify-transition.py`/`verify-guide-record.cjs`は`--record`で本当に予約を作るので、導入先の保守時間にだけ実行する。`verify-recorded-av.py`はlocalhost8888・録画先/recordedを前提とする。
 
-[検証マトリクス](../../docs/VALIDATION-MATRIX.ja.md) / [トラブル対応](../../docs/TROUBLESHOOTING.ja.md)。生ログ・設定・DB・録画はGitへ追加しない。
+[トラブル対応](../../docs/TROUBLESHOOTING.ja.md)。生ログ・設定・DB・録画はGitへ追加しない。

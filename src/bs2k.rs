@@ -1,4 +1,7 @@
 //! Owned live ISDB-S graph. The shared Broker serializes this with BS4K.
+mod capture;
+
+use capture::Capture;
 use crate::{
     cas::NativeCard,
     descramble::Decoder,
@@ -8,7 +11,7 @@ use crate::{
     xcdrv::{TsiMappingSnapshot, XcDrv},
 };
 use std::{
-    fs, io,
+    io,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -21,12 +24,12 @@ fn err(s: impl Into<String>) -> io::Error {
 }
 fn identity() -> io::Result<()> {
     for (path, want) in [
-        ("/usr/bin/tuner", "0416f546e87bd2b0c7a2e764ea0ee292"),
-        ("/usr/bin/abs", "def4436239553ede33f0febf86eab318"),
-        ("/disk/xc6drv/xcdrv.ko", "3db75958a29ecbb880c5a658584556d3"),
+        ("/usr/bin/tuner", "b94fc6a8f2e506dc66336c5d0d031b69"),
+        ("/usr/bin/abs", "1a3fdfa8379d75a802190b48ea951e9a"),
+        ("/disk/xc6drv/xcdrv.ko", "0bfa0f7db130e058f3ec838bbd681b7d"),
         (
             "/usr/vixs/lib/libvixs.so",
-            "27ed7eda99d63977a5989b9bdba7e571",
+            "344f0ef7b1a84d49ae13659d3a388d78",
         ),
     ] {
         let r = Command::new("md5sum").arg(path).output()?;
@@ -62,9 +65,8 @@ pub struct Source {
     connection: u32,
     filter: bool,
     running: bool,
-    reader: Option<XcReaderSource>,
+    capture: Option<Capture>,
     decoder: Decoder<NativeCard>,
-    scratch: Vec<u8>,
     last_data: Instant,
     dirty: Arc<AtomicBool>,
     label: String,
@@ -74,7 +76,6 @@ impl Source {
         drv: Arc<XcDrv>,
         freq: u32,
         tsid: u16,
-        service_id: u16,
         legacy: &AtomicBool,
         dirty: Arc<AtomicBool>,
     ) -> io::Result<Self> {
@@ -86,6 +87,7 @@ impl Source {
         identity()?;
         let card = NativeCard::open()?;
         let (system, iv) = card.parameters()?;
+        crate::fw_state::ensure_p4_idle(&drv)?;
         let mapping = drv.snapshot_tsi_mapping()?;
         let mut source = Self {
             drv,
@@ -97,9 +99,8 @@ impl Source {
             connection: 0,
             filter: false,
             running: false,
-            reader: None,
-            decoder: Decoder::new(card, system, iv, tsid).select_service(service_id),
-            scratch: Vec::new(),
+            capture: None,
+            decoder: Decoder::new(card, system, iv, tsid).full_multiplex(),
             last_data: Instant::now(),
             dirty,
             label: format!("ISDB-S RF {freq} TSID {tsid:04X} / native CAS + MULTI2"),
@@ -141,11 +142,11 @@ impl Source {
         source.running = true;
         source.buffer = source.drv.create_demux_ts_buffer()?;
         source.connection = source.drv.connect_output(source.device, source.buffer)?;
-        source.reader = Some(XcReaderSource::attach(
+        source.capture = Some(Capture::start(XcReaderSource::attach(
             Arc::clone(&source.drv),
             source.buffer,
             200,
-        )?);
+        )?)?);
         source
             .drv
             .add_demux_pid(source.device, u32::MAX, source.connection)?;
@@ -159,17 +160,17 @@ impl Source {
 impl TsSource for Source {
     fn read_into(&mut self, out: &mut Vec<u8>) -> io::Result<usize> {
         let before = out.len();
-        self.scratch.clear();
+        let bytes = self.capture.as_mut().unwrap().read()?;
         let result = (|| {
-            self.reader.as_mut().unwrap().read_into(&mut self.scratch)?;
-            if !self.scratch.is_empty() {
+            if !bytes.is_empty() {
                 self.last_data = Instant::now();
-                self.decoder.push(&self.scratch, out)?;
+                self.decoder.push(&bytes, out)?;
             } else if self.last_data.elapsed() > Duration::from_secs(8) {
                 return Err(err("BS2K input stopped for eight seconds"));
             }
             Ok(out.len() - before)
         })();
+        self.capture.as_ref().unwrap().recycle(bytes);
         result.map_err(|e| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -196,7 +197,7 @@ impl Drop for Source {
                 self.drv.remove_demux_pid(self.device, u32::MAX),
             );
         }
-        drop(self.reader.take());
+        drop(self.capture.take());
         if self.connection != 0 {
             if let Err(first) = self
                 .drv
@@ -262,6 +263,11 @@ impl Drop for Source {
         eprintln!(
             "mkra: BS2K closed: {} TS packets / {} decrypted / {} ECM updates; cleanup_ok={good}",
             self.decoder.packets, self.decoder.decrypted, self.decoder.updates
+        );
+        #[cfg(feature = "software-cas")]
+        eprintln!(
+            "mkra: software ECM updates accepted by this process: {}",
+            crate::software_cas::accepted_updates()
         );
     }
 }

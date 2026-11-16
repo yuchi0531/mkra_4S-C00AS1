@@ -6,6 +6,9 @@
 **/node_modules/
 **/__pycache__/
 *.pyc
+*.bin
+
+# Never commit anything recovered from the device or captured off the air.
 *.ts.dump
 *.ts
 *.m2ts

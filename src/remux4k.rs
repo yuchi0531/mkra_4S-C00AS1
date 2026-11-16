@@ -316,6 +316,12 @@ pub struct PsiGenerator {
 
 impl PsiGenerator {
     pub fn new(tsid: u16) -> Self {
+        Self::with_audio_type(tsid, AUDIO_STREAM_TYPE as u8)
+    }
+
+    /// Same, advertising `audio_type` for the audio PID (0x0F once the
+    /// stream has been rewritten to ADTS).
+    pub fn with_audio_type(tsid: u16, audio_type: u8) -> Self {
         let mut pat_body = Vec::new();
         pat_body.extend_from_slice(&(PROGRAM_NUMBER as u16).to_be_bytes());
         pat_body.extend_from_slice(&(0xE000u16 | PMT_PID as u16).to_be_bytes());
@@ -325,7 +331,7 @@ impl PsiGenerator {
         pmt_body.extend_from_slice(&0xF000u16.to_be_bytes()); // program_info_length = 0
         for (stream_type, pid) in [
             (VIDEO_STREAM_TYPE as u8, VIDEO_PID as u16),
-            (AUDIO_STREAM_TYPE as u8, AUDIO_PID as u16),
+            (audio_type, AUDIO_PID as u16),
         ] {
             pmt_body.push(stream_type);
             pmt_body.extend_from_slice(&(0xE000u16 | pid).to_be_bytes());
@@ -480,6 +486,7 @@ mod tests {
 use std::io;
 use std::time::{Duration, Instant};
 
+use crate::latm::AdtsRewriter;
 use crate::tssrc::{TsSource, XcReaderSource};
 
 /// Knobs the gate command and the server both need.
@@ -504,6 +511,9 @@ pub struct TapConfig {
     pub stall_abort_ms: u64,
     /// Log recovered gaps longer than this. Normal jitter is 150..390 ms.
     pub gap_log_ms: u64,
+    /// Rewrite the AAC audio from LATM (stream_type 0x11) to ADTS (0x0F).
+    /// TVTest only decodes ADTS; see `latm.rs`.
+    pub adts: bool,
 }
 
 impl Default for TapConfig {
@@ -517,6 +527,7 @@ impl Default for TapConfig {
             es_level_abort: 48,
             stall_abort_ms: 5000,
             gap_log_ms: 150,
+            adts: true,
         }
     }
 }
@@ -547,6 +558,8 @@ pub struct Tap {
     info_scratch: Vec<u8>,
     raw: Vec<u8>,
     unwrap: TtsUnwrap,
+    adts: Option<AdtsRewriter>,
+    ts_scratch: Vec<u8>,
     last_data: Instant,
     pub raw_total: u64,
     pub longest_gap: Duration,
@@ -573,12 +586,6 @@ pub fn verify_fresh_es(drv: &Arc<XcDrv>) -> io::Result<()> {
 impl Tap {
     pub fn open(drv: Arc<XcDrv>, cfg: TapConfig) -> io::Result<Self> {
         let live = discover(&drv).map_err(io::Error::other)?;
-        // Refuse to build into a half-rebuilt graph. Measured: right after a
-        // channel change the ES rings exist but the product's audio decoder
-        // has not reattached yet, and every ioctl against them then returns
-        // XCE_TIMEOUT — which leaves a half-built REMUX behind that stops the
-        // product from rebuilding at all. Both product decoders being attached
-        // is the cheap, reliable signal that the chain is live.
         if live.video_readers == 0 || live.audio_readers == 0 {
             if !cfg.allow_no_decoder {
                 return Err(io::Error::other(format!(
@@ -602,6 +609,10 @@ impl Tap {
                 ));
             }
             eprintln!("remux4k: explicit no-decoder diagnostic; both ES rings are advancing");
+        }
+        let level = drv.sbuf_status_raw(live.video_es)?[5];
+        if level >= cfg.es_level_abort {
+            return Err(io::Error::other(format!("the live video ES is already backed up to level {level:#x}")));
         }
         eprintln!(
             "remux4k: MMT_DEMUX={:#x} pipeline={:#x} video_es={:#x} (readers {}) audio_es={:#x} (readers {})",
@@ -627,6 +638,8 @@ impl Tap {
             info_scratch: Vec::with_capacity(64 * 1024),
             raw: Vec::with_capacity(320 * 1024),
             unwrap: TtsUnwrap::new(),
+            adts: cfg.adts.then(AdtsRewriter::new),
+            ts_scratch: Vec::with_capacity(320 * 1024),
             last_data: Instant::now(),
             raw_total: 0,
             longest_gap: Duration::from_millis(0),
@@ -654,10 +667,7 @@ impl Tap {
         self.conn_video = d.connect_input(self.device, self.live.video_es)?;
         self.conn_audio = d.connect_input(self.device, self.live.audio_es)?;
 
-        let ats_base = d.pipeline_get_time(self.live.pipeline).unwrap_or_else(|e| {
-            eprintln!("mkra: warning: pipeline get_time: {e}; using 0 as the ATS base");
-            0
-        });
+        let ats_base = d.pipeline_get_time(self.live.pipeline)?;
         let program = u32::from(self.cfg.service_id);
         d.remux_add_program(self.device, program, PCR_PID, PMT_PID, PCR_INTERVAL, ats_base)?;
         self.program_added = true;
@@ -815,13 +825,18 @@ impl TsSource for Tap {
         let before = out.len();
         let raw = std::mem::take(&mut self.raw);
         if self.cfg.raw_output {
-            // Keep the existing unwrap counters/validation, but write the
-            // actual TSOUT bytes, including timestamps and partial records.
-            let mut validation = Vec::new();
-            self.unwrap.push(&raw, &mut validation);
+            self.ts_scratch.clear();
+            self.unwrap.push(&raw, &mut self.ts_scratch);
             out.extend_from_slice(&raw);
         } else {
-            self.unwrap.push(&raw, out);
+        match self.adts.as_mut() {
+            Some(rw) => {
+                self.ts_scratch.clear();
+                self.unwrap.push(&raw, &mut self.ts_scratch);
+                rw.process(&self.ts_scratch, out);
+            }
+            None => self.unwrap.push(&raw, out),
+        }
         }
         self.raw = raw;
         Ok(out.len() - before)
@@ -844,6 +859,15 @@ impl Drop for Tap {
             self.unwrap.packets,
             self.unwrap.resyncs
         );
+        if let Some(rw) = &self.adts {
+            eprintln!(
+                "remux4k: audio LATM->ADTS: {} PES converted, {} passed through, {} AAC frames, {} errors",
+                rw.pes_converted,
+                rw.pes_passed,
+                rw.frames(),
+                rw.errors()
+            );
+        }
         self.teardown();
     }
 }

@@ -7,9 +7,9 @@
 use crate::{channels, si::LiveService, snapshot::procmem};
 use std::{fs, io, process::Command};
 
-const SESSION: u32 = 0x0039_a3fc;
+const SESSION: u32 = 0x0039_a37c;
 const PREFIX_LEN: usize = 64;
-const ADSB_MD5: &str = "44df75ed0aa1d98ffe30239695b1e5bf";
+const ADSB_MD5: &str = "c528482783c7705b1ead3ae31d695049";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {

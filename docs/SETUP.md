@@ -65,10 +65,10 @@ curl --fail --max-time 5 http://198.51.100.10:40772/api/tuners
 curl --fail --max-time 5 http://198.51.100.10:40772/api/services
 ```
 
-ライブstream要求は実際に選局する。通常BS後にHDMIが戻らない可能性を理解し、録画のない時間にだけ実施する。HTTP200やcodec名の表示で終えず、外部保存した標本の映像・音声をdecodeする。[実機検証表](VALIDATION-MATRIX.ja.md)。
+ライブstream要求は実際に選局する。通常BS後にHDMIが戻らない可能性を理解し、録画のない時間にだけ実施する。HTTP200やcodec名の表示で終えず、外部保存した標本の映像・音声をdecodeする。
 
 ## 6. EPGStation
 
 新しい外部Linuxサーバのproxy/scanner/timer/config/backup/録画検証は[新規導入手順](EPGSTATION-INSTALL.ja.md)へ。EPGStationを本体へインストールする構成ではない。
 
-本家由来のフラッシュ有効化等の説明は[旧SETUP](history/BASELINE-SETUP.md)に履歴として保存した。現行手順がフラッシュ変更を要求するものではない。
+本家由来のフラッシュ有効化等の説明は旧SETUPに履歴として保存した。現行手順がフラッシュ変更を要求するものではない。

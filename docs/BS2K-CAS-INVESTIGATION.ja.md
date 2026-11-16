@@ -2,7 +2,7 @@
 
 ## 受信と復号を分ける
 
-最初の188バイトTSではPAT/PMTは正常だったが映像・音声は暗号化されていた。純正type16 DESCRAMBLERの生成だけではPID・鍵スロット・接続が揃わず、映像にならなかった。現在は既存card daemonに通常BS用ECMを処理してもらい、CPUでMULTI2復号する。
+既存card daemonに通常BS用ECMを処理してもらい、CPUでMULTI2復号する。
 
 ## 採用した通信
 

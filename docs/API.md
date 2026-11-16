@@ -25,11 +25,15 @@ EPGStationは通常`mirakurunPath: http://127.0.0.1:40773/`として外部proxy�
 | テレ東 | 400171 | BS_TS4012 | 1100171 |
 | フジ | 400181 | BS_TS40D1 | 1100181 |
 
-朝日の151/152/153は内蔵設定。追加5局は`--isdbs-channels`のTSVを使う。`--channels`は既存4K局表の差替え用で、追加ISDB-S局表とは役割が異なる。
+`--isdbs-channels`のTSVを指定すると、その内容を通常BS・CSの局表として使用する。未指定時はBS朝日の151/152/153だけが登録される。`--channels`は4K局表の指定用で、通常BS・CS局表とは役割が異なる。
+
+このTSVの変更は5秒ごとに検出する。新しい局表を検証し、配信と受信経路の解放が終わってから同じ実行ファイル・引数で起動し直して反映する。不正な局表は適用せず、解放処理に失敗している場合も起動し直さない。更新元は完成したTSVを同じファイルシステム内でrenameして置き換える。
+
+通常BS・CSのTSVには`type`・`channel`・`network_id`・`service_id`・`transport_stream_id`・`freq_khz`・`name`列が必要。`channel`には親サーバーと同じキーを指定できるため、CSを`ND02`などの名前のまま扱える。同じチャンネルキーに異なる周波数・TSID・種別を設定することはできない。
 
 ### 本家由来の4K系局表
 
-以下は実装の内蔵テーブルであり、全行の現在の放送・受信・CAS・8K再生を保証しない。今回の2K後の4K切替実測はNHK・日テレ・TBSに限る。
+以下は実装の内蔵テーブルであり、全行の現在の放送・受信・CAS・8K再生を保証しない。
 
 | SID | Mirakurun id | 名前 | チャンネルキー | RF (kHz) | TSID |
 |---:|---:|---|---|---:|---|
@@ -68,6 +72,8 @@ EPGStationは通常`mirakurunPath: http://127.0.0.1:40773/`として外部proxy�
 - `priority` / `X-Mirakurun-Priority`は受理・usersへ表示するが、既存受信の強制横取りを行わない。
 - サービスstreamも多重全体を共有する。未知PIDの暗号化が残る場合がある。
 
+通常BS・CSの配信開始時は、先頭サービスだけでなくPATに含まれるPMTと既知ECMの処理結果を待つ。未送出のPMTやECMがある場合は、既存の22,000パケットの保持上限で受信済みデータを放出し、正常なサービスの配信を継続する。未処理・拒否されたECMに属するパケットは暗号化フラグを維持する。
+
 ### ステータスと選局の注意
 
 | コード/理由 | 意味・確認 |
@@ -86,4 +92,4 @@ EPGStationは通常`mirakurunPath: http://127.0.0.1:40773/`として外部proxy�
 
 BS4Kは192B TTSのtimestampを除去した188B TS。代表PIDはPCR0x1001、HEVC0x1011、AAC-LATM0x1100。通常BSは元の188B TSを保ち、PAT/PMT/ECMを追跡し、既知の暗号化AVを復号する。通常BSのPID/codecを4Kの値へ固定してはいけない。
 
-観測手順は[トラブル対応](TROUBLESHOOTING.ja.md)、測定の範囲は[検証表](VALIDATION-MATRIX.ja.md)。古い説明は[履歴版API](history/BASELINE-API.md)として残す。
+診断と復旧は[トラブル対応](TROUBLESHOOTING.ja.md)を参照してください。

@@ -47,6 +47,7 @@ pub const GET_GRAPH: c_int = 0x86; // xc_get_graph_func                (32 B)
 pub const GET_TEMPERATURE: c_int = 0x64;
 const MMR_BASE: c_int = 0x19; // returns the open-time userspace MMR map (4 B)
 const TSI_CONFIG: c_int = 0x50; // xc_tsi_config_func                  (40 B)
+const TSI_CONFIG_EX: c_int = 0x53;
 const TSI_STATUS: c_int = 0x51; // xc_tsi_status_func                  (36 B)
 
 const SDEV_CREATE: c_int = 0x28;
@@ -118,6 +119,7 @@ fn log_raw_words(label: &str, words: &[u32]) {
 /// Status/CRC registers are deliberately not part of the rollback image.
 #[derive(Debug)]
 pub struct TsiMappingSnapshot {
+    mapping: u32,
     registers: [u32; 3],
     requests: [[u32; 10]; 2],
 }
@@ -145,8 +147,12 @@ fn decode_physical_tsi(port: u32, registers: [u32; 3]) -> io::Result<[u32; 10]> 
 /// Therefore the product request is the direct logical-route form below, not
 /// the ASI/crossbar-selector form with bit 31.  Its logical m_port value must
 /// not be equated with the separately configured physical TSI port.
-const fn product_tsi_request(device: u32) -> [u32; 4] {
-    [device, 0, 0, 0]
+const fn product_tsi_request(device: u32, logical_port: u32) -> [u32; 4] {
+    [device, logical_port, 0, 0]
+}
+
+const fn explicit_tsi_request(device: u32, port: u32) -> [u32; 4] {
+    [device, 0, 0x8000_0000, port]
 }
 
 /// TSI attachment used by `ts_input_t::detect_stream` for a TS_RECODER.
@@ -161,7 +167,7 @@ const fn ts_recorder_tsi_request(device: u32, port: u32) -> [u32; 4] {
 
 /// Physical TSI setup issued by `abs` before it creates its MPEG-TS demux.
 ///
-/// `abs:0x287568..0x2875c6` builds `tsd_configure_t {enable=1, parallel=0, packet=0,
+/// `abs:0x28777c..0x2877da` builds `tsd_configure_t {enable=1, parallel=0, packet=0,
 /// use_sync=0, negative_edge=1, active_high=1, keep_null=1}` and calls
 /// `setup_tsi_port`. The caller's spro/system discriminator maps system 0 to
 /// physical TSI0 and system 2 (BS/CS 2K) to physical TSI1 before this helper.
@@ -565,6 +571,11 @@ impl XcDrv {
 
     unsafe fn call<T>(&self, request: c_int, arg: &mut T) -> io::Result<c_int> {
         sys::ioctl_ptr(self.fd(), request, arg as *mut T as *mut c_void)
+            .inspect_err(|error| {
+                if request != SBUF_GET_READ {
+                    eprintln!("xcdrv: ioctl {request:#010x} failed: {error}");
+                }
+            })
     }
 
     /// Read one XCode6 MMR word through the mapping installed by
@@ -963,7 +974,7 @@ impl XcDrv {
     /// `me_packet`. ISDB-S is transmitted as RS(204,188), so a demodulator that
     /// emits the 204-byte codeword would never sync against the 188 setting.
     pub fn configure_physical_tsi_packet(&self, port: u32, me_packet: u32) -> io::Result<()> {
-        self.configure_physical_tsi(port, me_packet, false)
+        self.configure_physical_tsi(port, me_packet, false, false)
     }
 
     /// Gate 5E2-SYNC: the product request with `m_use_sync_bit` selectable.
@@ -972,8 +983,20 @@ impl XcDrv {
         port: u32,
         me_packet: u32,
         use_sync: bool,
+        parallel: bool,
     ) -> io::Result<()> {
-        self.configure_physical_tsi_polarity(port, me_packet, use_sync, true, true, false)
+        self.configure_physical_tsi_edge(port, me_packet, use_sync, parallel, true)
+    }
+
+    pub fn configure_physical_tsi_edge(
+        &self,
+        port: u32,
+        me_packet: u32,
+        use_sync: bool,
+        parallel: bool,
+        negative_edge: bool,
+    ) -> io::Result<()> {
+        self.configure_physical_tsi_polarity(port, me_packet, use_sync, negative_edge, true, parallel)
     }
 
     /// Bounded electrical-interface experiment. Only the documented clock
@@ -987,6 +1010,17 @@ impl XcDrv {
         req[6] = u32::from(active_high);
         req[8] = u32::from(negative_edge);
         log_raw_words("physical TSI config request", &req);
+        unsafe { self.call(TSI_CONFIG, &mut req)? };
+        Ok(())
+    }
+
+    pub fn configure_tsi1_baseline_signal(&self, enabled: bool) -> io::Result<()> {
+        let mut req = product_physical_tsi_request(1, ME_PACKET_188, false);
+        req[3] = u32::from(enabled);
+        req[6] = 0;
+        req[8] = 0;
+        req[9] = 1;
+        log_raw_words("TSI1 baseline signal request", &req);
         unsafe { self.call(TSI_CONFIG, &mut req)? };
         Ok(())
     }
@@ -1014,18 +1048,21 @@ impl XcDrv {
     }
 
     pub fn snapshot_tsi_mapping(&self) -> io::Result<TsiMappingSnapshot> {
-        if self.mmr_read32(0x61f0)? != 0x10 {
-            return Err(io::Error::other("TSI mapping is not the measured identity 0x10"));
+        let mapping = self.mmr_read32(0x61f0)?;
+        if !matches!(mapping, 0 | 0x10) {
+            return Err(io::Error::other(format!("unsupported TSI mapping {mapping:#x}")));
         }
         let registers = [self.mmr_read32(0x6000)?, self.mmr_read32(0x6008)?, self.mmr_read32(0x600c)?];
-        Ok(TsiMappingSnapshot {registers, requests: [decode_physical_tsi(0,registers)?, decode_physical_tsi(1,registers)?]})
+        Ok(TsiMappingSnapshot {mapping, registers, requests: [decode_physical_tsi(0,registers)?, decode_physical_tsi(1,registers)?]})
     }
 
     /// One bounded hypothesis: logical input 1 consumes physical input 0.
     /// config_ex's eleventh word selects physical ASI; no MMIO writes here.
     pub fn map_tsi_one_to_zero(&self) -> io::Result<()> {
-        if self.mmr_read32(0x61f0)? != 0x10 {
-            return Err(io::Error::other("TSI remap compare-before-write failed"));
+        match self.mmr_read32(0x61f0)? {
+            0 => return Ok(()),
+            0x10 => {},
+            _ => return Err(io::Error::other("TSI remap compare-before-write failed")),
         }
         let registers = [self.mmr_read32(0x6000)?, self.mmr_read32(0x6008)?, self.mmr_read32(0x600c)?];
         let physical = decode_physical_tsi(0,registers)?;
@@ -1033,7 +1070,7 @@ impl XcDrv {
         req[..10].copy_from_slice(&physical);
         req[0]=1; req[10]=0;
         log_raw_words("logical TSI1 to physical TSI0 config_ex", &req);
-        unsafe { self.call(0x53, &mut req)? };
+        unsafe { self.call(TSI_CONFIG_EX, &mut req)? };
         if self.mmr_read32(0x61f0)? != 0 {
             return Err(io::Error::other("TSI remap readback differs"));
         }
@@ -1045,24 +1082,33 @@ impl XcDrv {
         if !matches!(current, 0 | 0x10) {
             return Err(io::Error::other("foreign TSI mapping change; refusing overwrite"));
         }
+        let port = (saved.mapping >> 4) as usize;
         let mut req = [0u32;11];
-        req[..10].copy_from_slice(&saved.requests[1]); req[10]=1;
-        log_raw_words("restore logical TSI1 identity and physical TSI1", &req);
-        unsafe {self.call(0x53, &mut req)?};
-        let mut physical = saved.requests[0];
-        log_raw_words("restore physical TSI0", &physical);
+        req[..10].copy_from_slice(&saved.requests[port]); req[0]=1; req[10]=port as u32;
+        log_raw_words("restore saved logical TSI1 mapping and physical configuration", &req);
+        unsafe {self.call(TSI_CONFIG_EX, &mut req)?};
+        let mut physical = saved.requests[1-port];
+        log_raw_words("restore other physical TSI port", &physical);
         unsafe {self.call(TSI_CONFIG, &mut physical)?};
         let actual = [self.mmr_read32(0x6000)?,self.mmr_read32(0x6008)?,self.mmr_read32(0x600c)?];
-        if actual != saved.registers || self.mmr_read32(0x61f0)? != 0x10 {
-            return Err(io::Error::other(format!("TSI rollback readback differs: {actual:08x?} expected {:08x?}", saved.registers)));
+        let mapping = self.mmr_read32(0x61f0)?;
+        if actual != saved.registers || mapping != saved.mapping {
+            return Err(io::Error::other(format!("TSI rollback readback differs: {actual:08x?} expected {:08x?}, mapping {mapping:#x} expected {:#x}", saved.registers, saved.mapping)));
         }
-        eprintln!("TSI rollback: configuration MMRs and identity mapping exactly restored");
+        eprintln!("TSI rollback: configuration MMRs and saved mapping {:#x} exactly restored", saved.mapping);
         Ok(())
     }
 
     pub fn config_tsi_product_route(&self, device: u32) -> io::Result<()> {
-        let mut req = product_tsi_request(device);
+        let mut req = product_tsi_request(device, 0);
         log_raw_words("DEMUX direct-route request", &req);
+        unsafe { self.call(SDEV_CONFIG_TSI, &mut req)? };
+        Ok(())
+    }
+
+    pub fn config_tsi_explicit_route(&self, device: u32, port: u32) -> io::Result<()> {
+        let mut req = explicit_tsi_request(device, port);
+        log_raw_words("DEMUX explicit-route request", &req);
         unsafe { self.call(SDEV_CONFIG_TSI, &mut req)? };
         Ok(())
     }
@@ -1438,8 +1484,8 @@ mod tests {
 
     #[test]
     fn product_tsi_route_is_direct_logical_port_zero() {
-        assert_eq!(product_tsi_request(0x0c), [0x0c, 0, 0, 0]);
-        assert_eq!(product_tsi_request(0x12), [0x12, 0, 0, 0]);
+        assert_eq!(product_tsi_request(0x0c, 0), [0x0c, 0, 0, 0]);
+        assert_eq!(product_tsi_request(0x12, 1), [0x12, 1, 0, 0]);
     }
 
     #[test]

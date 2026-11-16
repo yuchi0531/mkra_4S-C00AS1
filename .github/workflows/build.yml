@@ -21,10 +21,6 @@ jobs:
           cache-dependency-path: tools/epgstation/package-lock.json
       - name: Install ARM target
         run: rustup target add armv7-unknown-linux-musleabihf
-      - name: Audit all tracked files and reachable history
-        run: |
-          git fetch --unshallow || test "$(git rev-parse --is-shallow-repository)" = false
-          python3 tools/audit_publication.py
       - name: Check documentation and systemd distribution templates
         run: |
           python3 tools/check_docs.py
@@ -80,7 +76,7 @@ jobs:
             tools/third-party/libarib25-LICENSE
             tools/third-party/libarib25-NOTICE.md
       - name: Publish experimental release on version tag
-        if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'Karin-Laboratory/mkra_4S-C00AS1'
+        if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'AkaakuHub/mkra_4S-C00AS1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

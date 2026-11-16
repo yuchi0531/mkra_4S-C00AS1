@@ -20,13 +20,17 @@
 mod api;
 mod bs2k;
 mod cas;
+mod channel_sync;
 mod descramble;
 #[path = "../tools/multi2.rs"]
 mod multi2;
 mod native_selection;
+mod power;
 mod channels;
 mod cpld;
 mod findbuf;
+mod fw_state;
+mod latm;
 mod graph;
 mod gr;
 mod gr_i2c;
@@ -37,6 +41,8 @@ mod json;
 mod remux4k;
 mod si;
 mod snapshot;
+#[cfg(feature = "software-cas")]
+mod software_cas;
 mod stream;
 mod sys;
 mod testts;
@@ -59,6 +65,27 @@ use stream::{Broker, BrokerConfig};
 use tssrc::{FileSource, NullSource, PassiveRingSource, TsSource};
 use xcdrv::XcDrv;
 
+static REMUX_TERMINATE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" {
+    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+#[cfg(unix)]
+extern "C" fn request_remux_termination(_: i32) {
+    REMUX_TERMINATE.store(true, Ordering::Relaxed);
+}
+
+fn install_remux_termination_handler() -> io::Result<()> {
+    REMUX_TERMINATE.store(false, Ordering::Relaxed);
+    #[cfg(unix)]
+    if unsafe { signal(15, request_remux_termination) } == usize::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn is_xce_no_support(error: &io::Error) -> bool {
     error.raw_os_error() == Some(1003)
 }
@@ -68,6 +95,7 @@ mkra — Mirakurun-compatible relay for the SHARP 4S-C00AS1
 
 USAGE:
   mkra serve [options]
+  mkra receiver-status
   mkra probe [options]
   mkra dump  --buffer <handle> --out <path> [--seconds <n>] [--reader <handle>|--passive]
   mkra graph [--watch <n>] [--sniff]
@@ -129,14 +157,9 @@ SERVE OPTIONS:
   --max-clients <n>     concurrent stream clients      (default 4)
   --tune                let mkra change the box's channel when a client asks
                         for a service it is not showing (default: off)
-  --idle-sleep <sec>    with --remux4k --tune: after this many seconds with no
-                        client, park the tuner on a transponder that carries no
-                        signal, so the 4K decode block idles while the box stays
-                        powered on. The next stream request tunes back (~4 s).
-                        0 = off, the default.
-  --park-freq <kHz>     transponder to park on (default 12431000, a CS-4K slot
-  --park-tsid <hex>     not receivable at this site; default TSID c090). Pick
-                        one your dish does NOT receive.
+  --idle-sleep <sec>    with --bs2k: put satellite RF into standby after this
+                        many idle seconds; the next stream retunes (default 0).
+                        The receiver API and Linux remain running.
   --tuner-no <1..3>     which frontend to tune         (default 1)
   --input-port <n>      inputPortNo, must be >= 100    (default 101)
   --reply-qid <n>       product-internal reply queue   (default 0; unused, see DESIGN.md §6.2)
@@ -344,6 +367,11 @@ fn main() {
         "serve" => cmd_serve(&opts),
         "probe" => cmd_probe(&opts),
         "dump" => cmd_dump(&opts),
+        "latm2adts" => cmd_latm2adts(&opts),
+        "fw-queue" => match fw_state::print_queue() { Ok(()) => 0, Err(e) => { eprintln!("{e}"); 1 } },
+        "fw-p4-queue" => match fw_state::print_p4_queue() { Ok(()) => 0, Err(e) => { eprintln!("{e}"); 1 } },
+        "receiver-status" => match power::status() { Ok(()) => 0, Err(e) => { eprintln!("{e}"); 1 } },
+        "fw-state" => match fw_state::print() { Ok(()) => 0, Err(e) => { eprintln!("{e}"); 1 } },
         "graph" => cmd_graph(&opts),
         "peek" => cmd_peek(&opts),
         "tune" => cmd_tune(&opts),
@@ -798,6 +826,7 @@ struct Options {
     tsid: u16,
     passive: bool,
     raw_stream: bool,
+    remux4k_latm: bool,
     epg_dir: Option<String>,
     epg_refresh_secs: u64,
     epg_tap: bool,
@@ -836,11 +865,8 @@ struct Options {
     tune_mode: u32,
     /// tune4k: set the `NotDecode` word.
     no_decode: bool,
-    /// serve: stop the box decoding after this many idle seconds (0 = never).
+    /// serve: put satellite RF into standby after this many idle seconds.
     idle_sleep_secs: u64,
-    /// serve: transponder to park on when idle (no signal here = decoders idle).
-    park_freq_khz: u32,
-    park_tsid: u16,
     fem_dev: Option<u32>,
     disconnect: bool,
     reader: Option<u32>,
@@ -907,6 +933,7 @@ impl Options {
             tsid: 0xFFFF,
             passive: false,
             raw_stream: false,
+            remux4k_latm: false,
             epg_dir: None,
             epg_refresh_secs: 300,
             epg_tap: false,
@@ -934,8 +961,6 @@ impl Options {
             tune_mode: tuner::TUNE_CHANNEL_CHANGE,
             no_decode: false,
             idle_sleep_secs: 0,
-            park_freq_khz: 12_431_000,
-            park_tsid: 0xC090,
             fem_dev: None,
             disconnect: false,
             reader: None,
@@ -1005,8 +1030,6 @@ impl Options {
                 "--tune-mode" => o.tune_mode = parse_num(&value()?, a)? as u32,
                 "--no-decode" => o.no_decode = true,
                 "--idle-sleep" => o.idle_sleep_secs = parse_num(&value()?, a)?,
-                "--park-freq" => o.park_freq_khz = parse_num(&value()?, a)? as u32,
-                "--park-tsid" => o.park_tsid = u16::from_str_radix(value()?.trim_start_matches("0x"), 16).map_err(|e| format!("--park-tsid: {e}"))?,
                 "--epg-refresh" => o.epg_refresh_secs = parse_num(&value()?, a)? as u64,
                 "--channel-type" => o.channel_type = value()?,
                 "--bs2k" => o.bs2k = true,
@@ -1067,6 +1090,7 @@ impl Options {
                         .map_err(|_| format!("--tsid: `{v}` is not hex"))?;
                 }
                 "--passive" => o.passive = true,
+                "--audio-latm" => o.remux4k_latm = true,
                 "--raw-stream" => o.raw_stream = true,
                 other => return Err(format!("unknown option `{other}`")),
             }
@@ -1221,15 +1245,20 @@ fn cmd_serve(opts: &Options) -> i32 {
         }
     };
     table.set_channel_type(&opts.channel_type);
+    let isdbs_base = opts.isdbs_channels.as_ref().map(|_| table.clone());
+    let mut isdbs_loaded = None;
     if opts.bs2k {
-        if !opts.remux4k_backend || !opts.tune || opts.file.is_some() || opts.test_pattern || opts.idle_sleep_secs>0 || opts.raw_stream {
-            eprintln!("mkra: --bs2k requires --remux4k --tune, without file/test/raw/idle-sleep");return 2;
+        if !opts.remux4k_backend || !opts.tune || opts.file.is_some() || opts.test_pattern || opts.raw_stream {
+            eprintln!("mkra: --bs2k requires --remux4k --tune, without file/test/raw");return 2;
         }
-        table.add_verified_bs2k();
         if let Some(path)=&opts.isdbs_channels {
-            let result=std::fs::read_to_string(path).map_err(|e|e.to_string()).and_then(|s|table.add_isdbs_tsv(&s));
+            let result=std::fs::read_to_string(path).map_err(|e|e.to_string()).and_then(|s| {
+                table.add_isdbs_tsv(&s)?;
+                isdbs_loaded = Some(s);
+                Ok(())
+            });
             if let Err(e)=result {eprintln!("mkra: ISDB-S channel table: {e}");return 2;}
-        }
+        } else {table.add_verified_bs2k();}
     }
     if opts.isdbs_channels.is_some() && !opts.bs2k {eprintln!("mkra: --isdbs-channels requires --bs2k");return 2;}
     // Cross-process ownership for the integrated physical frontend.
@@ -1241,10 +1270,21 @@ fn cmd_serve(opts: &Options) -> i32 {
         Some(file)
     }else {None};
 
-    // Set while the tuner is parked on a dead transponder. The SI still names
-    // the old service then, so the "already on the right service" shortcut in
-    // the factory must not be taken; the idle thread and the factory share it.
-    let parked = Arc::new(AtomicBool::new(false));
+    if opts.idle_sleep_secs > 0 && !opts.bs2k {
+        eprintln!("mkra: --idle-sleep requires --bs2k");
+        return 2;
+    }
+    let sleeping = if opts.bs2k {
+        match power::is_sleeping() {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("mkra: cannot read receiver power state: {e}");
+                return 1;
+            }
+        }
+    } else { false };
+    let resume_required = Arc::new(AtomicBool::new(sleeping));
+    let cleanup_failed = Arc::new(AtomicBool::new(false));
 
     // Decide the TS backend once, up front, so the operator learns immediately
     // rather than at the first stream request.
@@ -1316,9 +1356,9 @@ fn cmd_serve(opts: &Options) -> i32 {
         let legacy=Arc::new(AtomicBool::new(if opts.bs2k {
             match bs2k::legacy_frontend() {Ok(v)=>v,Err(e)=>{eprintln!("mkra: frontend mode: {e}");return 1;}}
         }else{false}));
-        let dirty=Arc::new(AtomicBool::new(false));
+        let dirty=Arc::clone(&cleanup_failed);
         let unified=opts.bs2k;
-        let legacy_channels:BTreeMap<String,(u32,u16,u16)>=table.channels.iter().filter(|c|c.is_bs2k()).filter_map(|c|c.services.first().map(|s|(c.key.clone(),(c.freq_khz,c.tsid,s.service_id)))).collect();
+        let legacy_channels:BTreeMap<String,(u32,u16)>=table.channels.iter().filter(|c|c.is_bs2k()).map(|c|(c.key.clone(),(c.freq_khz,c.tsid))).collect();
         let base = remux4k::TapConfig {
             with_tsinfo: !opts.remux4k_no_tsinfo,
             es_level_abort: opts.remux4k_es_level_abort,
@@ -1331,12 +1371,15 @@ fn cmd_serve(opts: &Options) -> i32 {
         // the box is already showing.
         let may_tune = opts.tune;
         let oid = Arc::new(AtomicU32::new(0x40));
-        let parked_for_factory = Arc::clone(&parked);
+        let resume_for_factory = Arc::clone(&resume_required);
         (
             Box::new(move |key: &str| {
                 if dirty.load(Ordering::SeqCst) {return Err(io::Error::other("previous cleanup failed; tuner is blocked"))}
-                if let Some(&(freq,tsid,sid))=legacy_channels.get(key) {
-                    return bs2k::Source::open(Arc::clone(&drv),freq,tsid,sid,&legacy,Arc::clone(&dirty)).map(|s|Box::new(s) as Box<dyn TsSource>);
+                if let Some(&(freq,tsid))=legacy_channels.get(key) {
+                    return bs2k::Source::open(Arc::clone(&drv),freq,tsid,&legacy,Arc::clone(&dirty)).map(|s| {
+                        resume_for_factory.store(false, Ordering::SeqCst);
+                        Box::new(s) as Box<dyn TsSource>
+                    });
                 }
                 if !want.contains_key(key) {return Err(io::Error::other("unknown channel"))}
                 let restored=legacy.load(Ordering::SeqCst);
@@ -1346,11 +1389,14 @@ fn cmd_serve(opts: &Options) -> i32 {
                 }
                 if unified {
                     let asked=want[key];
-                    let live=unified_tune4k(&drv,asked,&oid,restored)?;
+                    let live=unified_tune4k(&drv,asked,&oid,restored || resume_for_factory.load(Ordering::SeqCst))?;
                     let no_decoder=remux4k::discover(&drv).is_ok_and(|es|es.video_readers==0 || es.audio_readers==0);
                     let cfg=remux4k::TapConfig {stream_id:live.tlv_stream_id, service_id:live.service_id,
                         allow_no_decoder:true, es_level_abort:if no_decoder {101}else{base.es_level_abort}, ..base};
-                    return remux4k::Tap::open(Arc::clone(&drv),cfg).map(|t|Box::new(t) as Box<dyn TsSource>);
+                    return remux4k::Tap::open(Arc::clone(&drv),cfg).map(|t| {
+                        resume_for_factory.store(false, Ordering::SeqCst);
+                        Box::new(t) as Box<dyn TsSource>
+                    });
                 }
                 let mut live = si::live_service(si::ADSB_SI_DIR).ok_or_else(|| {
                     io::Error::other(format!(
@@ -1364,11 +1410,6 @@ fn cmd_serve(opts: &Options) -> i32 {
                     // channel-change form is accepted and ignored — measured:
                     // the SI never moves. The resume form is what the product
                     // sends when it wakes, and it both wakes and tunes.
-                    let was_parked = parked_for_factory.swap(false, Ordering::Relaxed);
-                    if may_tune && was_parked {
-                        // Parked: whatever the SI says, the chain is starved.
-                        live = tune_and_wait(asked, &oid)?;
-                    }
                     let decoding = remux4k::discover(&drv).is_ok();
                     if may_tune && !decoding {
                         // Asleep. Measured: the resume message only restarts
@@ -1400,26 +1441,8 @@ fn cmd_serve(opts: &Options) -> i32 {
                     es_level_abort: if unified && remux4k::discover(&drv).is_ok_and(|es|es.video_readers==0 || es.audio_readers==0) {101}else{base.es_level_abort},
                     ..base
                 };
-                match remux4k::Tap::open(Arc::clone(&drv), cfg) {
-                    Ok(t) => Ok(Box::new(t) as Box<dyn TsSource>),
-                    Err(first) => {
-                        // One retry: the product can still be settling right
-                        // after a change, and a second later the same sequence
-                        // succeeds.
-                        eprintln!("mkra: tap failed ({first}); retrying once");
-                        std::thread::sleep(Duration::from_millis(1000));
-                        let live = si::live_service(si::ADSB_SI_DIR).unwrap_or(live);
-                        let cfg = remux4k::TapConfig {
-                            stream_id: live.tlv_stream_id,
-                            service_id: live.service_id,
-                            allow_no_decoder: unified,
-                            es_level_abort: if unified && remux4k::discover(&drv).is_ok_and(|es|es.video_readers==0 || es.audio_readers==0) {101}else{base.es_level_abort},
-                            ..base
-                        };
-                        remux4k::Tap::open(Arc::clone(&drv), cfg)
-                            .map(|t| Box::new(t) as Box<dyn TsSource>)
-                    }
-                }
+                remux4k::Tap::open(Arc::clone(&drv), cfg)
+                    .map(|t| Box::new(t) as Box<dyn TsSource>)
             }),
             if unified {"BS4K REMUX + BS2K native CAS/MULTI2 (one tuner)"}else{"BS4K REMUX tap (live MMT -> MPEG-TS)"}.to_string(),
         )
@@ -1519,6 +1542,7 @@ fn cmd_serve(opts: &Options) -> i32 {
             ring_bytes: opts.ring,
             max_clients: opts.max_clients,
             linger: Duration::from_secs(3),
+            switch_grace: Duration::from_secs(2),
         },
         factory,
     );
@@ -1596,43 +1620,27 @@ fn cmd_serve(opts: &Options) -> i32 {
         }
     }
 
-    // Idle sleep. Nothing to tap means nothing to serve, so when no client has
-    // been connected for a while the decode chain can go: it is the same state
-    // the product itself uses in standby, and waking is one message away
-    // (measured: graph 22 devices -> 11 on sleep, back within 3 s).
-    if opts.remux4k_backend && opts.tune && opts.idle_sleep_secs > 0 {
-        let idle_broker = Arc::clone(&broker);
-        let idle = Duration::from_secs(opts.idle_sleep_secs);
-        let idle_oid = Arc::new(AtomicU32::new(0x80));
-        let idle_parked = Arc::clone(&parked);
-        let (park_freq, park_tsid) = (opts.park_freq_khz, opts.park_tsid);
-        std::thread::Builder::new()
-            .name("mkra-idle".into())
-            .stack_size(64 * 1024)
-            .spawn(move || {
-                let mut since = Instant::now();
-                let mut asleep = false;
-                loop {
-                    std::thread::sleep(Duration::from_secs(5));
-                    if idle_broker.current().is_some() {
-                        since = Instant::now();
-                        asleep = false;
-                        continue;
-                    }
-                    if asleep || since.elapsed() < idle {
-                        continue;
-                    }
-                    match park_tuner(&idle_oid, park_freq, park_tsid) {
-                        Ok(()) => {
-                            idle_parked.store(true, Ordering::Relaxed);
-                            asleep = true;
-                        }
-                        Err(e) => eprintln!("mkra: idle park failed: {e}"),
-                    }
-                }
-            })
-            .ok();
+    if opts.idle_sleep_secs > 0 {
+        if let Err(e) = power::start_idle_task(
+            Arc::clone(&broker), Duration::from_secs(opts.idle_sleep_secs),
+            resume_required, Arc::clone(&cleanup_failed),
+        ) {
+            eprintln!("mkra: cannot start idle receiver control: {e}");
+            return 1;
+        }
     }
+
+    let channel_file = opts.isdbs_channels.clone().zip(isdbs_loaded).zip(isdbs_base)
+        .map(|((path, loaded), base)| channel_sync::ChannelFile { path, loaded, base });
+    if channel_file.is_some() || (opts.bs2k && cfg!(feature = "software-cas")) {
+        if let Err(error) = channel_sync::start(
+            channel_file, Arc::clone(&broker), cleanup_failed,
+        ) {
+            eprintln!("mkra: cannot start receiver configuration synchronization: {error}");
+            return 1;
+        }
+    }
+
 
     let addr = format!("{}:{}", opts.bind, opts.port);
     let listener = match TcpListener::bind(&addr) {
@@ -1648,6 +1656,7 @@ fn cmd_serve(opts: &Options) -> i32 {
         api::MKRA_VERSION,
         state.table.channels.len()
     );
+
 
     let handler_state = Arc::clone(&state);
     let result = http::serve(
@@ -3460,14 +3469,14 @@ fn cmd_remux4k(opts: &Options) -> i32 {
         };
     }
 
-    if opts.raw_stream && opts.remux4k_inject_psi {
-        eprintln!("mkra: raw TTS output cannot include injected 188-byte PSI");
-        return 2;
-    }
     let Some(out) = opts.out.clone() else {
         eprintln!("mkra: remux4k needs --out <path> ('-' for stdout)");
         return 2;
     };
+    if let Err(e) = install_remux_termination_handler() {
+        eprintln!("mkra: cannot handle stream termination: {e}");
+        return 1;
+    }
     let mut sink: Box<dyn Write> = if out == "-" {
         Box::new(io::stdout())
     } else {
@@ -3491,30 +3500,22 @@ fn cmd_remux4k(opts: &Options) -> i32 {
     // filtered MMT-SI, so the PAT/PMT name the service the box is actually
     // showing rather than a placeholder.
     let live_service = si::live_service(si::ADSB_SI_DIR);
-    let mut cfg = remux4k::TapConfig {
+    let cfg = remux4k::TapConfig {
         stream_id: live_service.map(|s| s.tlv_stream_id).unwrap_or(1),
-        allow_no_decoder: opts.remux4k_allow_no_decoder,
-        raw_output: opts.raw_stream,
         service_id: live_service
             .map(|s| s.service_id)
             .unwrap_or(remux4k::PROGRAM_NUMBER as u16),
         with_tsinfo: !opts.remux4k_no_tsinfo,
         es_level_abort: opts.remux4k_es_level_abort,
         stall_abort_ms: opts.remux4k_stall_abort_ms,
+        adts: !opts.remux4k_latm,
+        allow_no_decoder: opts.remux4k_allow_no_decoder,
+        raw_output: opts.raw_stream,
         ..remux4k::TapConfig::default()
     };
-    if let Some(sid) = opts.sid {
-        let Some((tsid, _, _)) = channels::tuning_record(sid) else {
-            eprintln!("mkra: remux4k --sid must name a known 4K service");
-            return 2;
-        };
-        cfg.service_id = sid;
-        cfg.stream_id = tsid;
-        eprintln!("remux4k: explicit TS identity service {sid} stream {:#06x}; no retune", cfg.stream_id);
-    }
     match live_service {
         Some(s) => eprintln!(
-            "remux4k: SI cache service {} on TLV stream {:#06x} (network {:#06x})",
+            "remux4k: live service {} on TLV stream {:#06x} (network {:#06x})",
             s.service_id, s.tlv_stream_id, s.original_network_id
         ),
         None => eprintln!(
@@ -3533,22 +3534,27 @@ fn cmd_remux4k(opts: &Options) -> i32 {
         }
     };
 
-    let mut psi = remux4k::PsiGenerator::new(tsid);
+    let audio_type = if opts.remux4k_latm {
+        remux4k::AUDIO_STREAM_TYPE as u8
+    } else {
+        latm::STREAM_TYPE_ADTS
+    };
+    let mut psi = remux4k::PsiGenerator::with_audio_type(tsid, audio_type);
     let deadline = Instant::now() + Duration::from_secs(opts.seconds);
     let mut next_psi = Instant::now();
     let (mut ts, mut sample) = (Vec::new(), Vec::new());
     let mut ts_total = 0u64;
-    let mut validated_ts_total = 0u64;
-    let mut raw_validator = remux4k::TtsUnwrap::new();
-    let mut normalized = Vec::new();
     let mut pids: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
     let mut failure: Option<String> = None;
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !REMUX_TERMINATE.load(Ordering::Relaxed) {
         ts.clear();
         match tap.read_into(&mut ts) {
             Ok(0) => continue,
             Ok(_) => {}
             Err(e) => {
+                if REMUX_TERMINATE.load(Ordering::Relaxed) {
+                    break;
+                }
                 failure = Some(e.to_string());
                 break;
             }
@@ -3570,17 +3576,11 @@ fn cmd_remux4k(opts: &Options) -> i32 {
             break;
         }
         ts_total += ts.len() as u64;
-        let measured = if opts.raw_stream {
-            normalized.clear();
-            raw_validator.push(&ts, &mut normalized);
-            &normalized
-        } else { &ts };
-        validated_ts_total += measured.len() as u64;
         if sample.len() < 1024 * 1024 {
-            let take = (1024 * 1024 - sample.len()).min(measured.len());
-            sample.extend_from_slice(&measured[..take]);
+            let take = (1024 * 1024 - sample.len()).min(ts.len());
+            sample.extend_from_slice(&ts[..take]);
         }
-        for (pid, n) in remux4k::pid_histogram(measured) {
+        for (pid, n) in remux4k::pid_histogram(&ts) {
             *pids.entry(pid).or_insert(0usize) += n;
         }
     }
@@ -3598,12 +3598,10 @@ fn cmd_remux4k(opts: &Options) -> i32 {
         .take(8)
         .map(|(pid, n)| format!("{pid:#06x}:{n}"))
         .collect();
-    if opts.raw_stream {
-        println!("remux4k: TSOUT {raw_total} raw bytes -> {ts_total} TTS file bytes; validated {validated_ts_total} TS bytes; 188-byte sync ratio {ratio:.4}");
-    } else {
-        println!("remux4k: TSOUT {raw_total} raw bytes -> {ts_total} TS bytes; 188-byte sync ratio {ratio:.4}");
-    }
-    println!("remux4k: PIDs {}", top.join(" "));
+    eprintln!(
+        "remux4k: TSOUT {raw_total} raw bytes -> {ts_total} TS bytes; 188-byte sync ratio {ratio:.4}"
+    );
+    eprintln!("remux4k: PIDs {}", top.join(" "));
     let has_video = hist
         .iter()
         .any(|(pid, n)| u32::from(*pid) == remux4k::VIDEO_PID && *n > 0);
@@ -3614,12 +3612,6 @@ fn cmd_remux4k(opts: &Options) -> i32 {
     }
 }
 
-/// Ask the product to change channel and wait for its own SI to agree.
-///
-/// The product republishes `AdsbSiMhSdtActual.dat` once the new service runs,
-/// which is the same evidence `si::live_service` uses everywhere else, so the
-/// switch is confirmed by the box rather than assumed from a send that cannot
-/// be acknowledged. Measured: the new service appears within about 4 s.
 fn tune_and_wait(service_id: u16, oid: &Arc<AtomicU32>) -> io::Result<si::LiveService> {
     tune_and_wait_mode(service_id, oid, tuner::TUNE_CHANNEL_CHANGE)
 }
@@ -3633,26 +3625,6 @@ fn tune_and_wait(service_id: u16, oid: &Arc<AtomicU32>) -> io::Result<si::LiveSe
 /// same message is accepted and ignored, so this is not yet a dependable
 /// sleep: the product's real power state lives in its UIM/INI state machine,
 /// which is not yet decoded. Waking, by contrast, is reliable (§`TUNE_RESUME`).
-fn sleep_decode(service_id: u16, oid: &Arc<AtomicU32>) -> io::Result<()> {
-    let Some((tsid, freq_khz, bid)) = channels::tuning_record(service_id) else {
-        return Err(io::Error::other(format!(
-            "service {service_id} is not in the advanced-BS table"
-        )));
-    };
-    let req = tuner::ChangeChannelRequest {
-        oid: oid.fetch_add(1, Ordering::Relaxed),
-        tune: tuner::TUNE_CHANNEL_CHANGE,
-        not_decode: 1,
-        service_id,
-        freq_khz,
-        tlv_stream_id: tsid,
-        bid,
-    };
-    let t = tuner::Tuner::open_qid(tuner::ADSB_COMM_QID, tuner::MSGH_LIST)?;
-    eprintln!("mkra: idle — asking the box to stop decoding (service {service_id})");
-    t.change_channel(&req)
-}
-
 /// The native presentation cache can retain a previous MH-SDT indefinitely
 /// after BS2K stops HDMI decoding. Confirm native acquired package and live ES,
 /// rather than waiting for the HDMI decoder or assigning the requested ID.
@@ -3737,33 +3709,6 @@ fn tune_and_wait_mode(
     Err(io::Error::other(format!(
         "asked the box for service {service_id} but its SI never confirmed the switch"
     )))
-}
-
-/// Park the tuner on a transponder that carries no signal here.
-///
-/// The decoders then have nothing to decode: measured, the product keeps its
-/// devices allocated but the video ES ring only drains (12 -> 11 units in 8 s)
-/// and no new data arrives, so the 4K decode block idles while the box stays
-/// powered on. It is undone by tuning at any real service, which takes about
-/// 4 s — the same cost as a channel change.
-///
-/// This is the dependable idle mode. The product's own standby is lighter
-/// still (it powers the tuner down too) but can only be entered from the
-/// remote, and `NotDecode = 1` is ignored unless the box is already in standby.
-fn park_tuner(oid: &Arc<AtomicU32>, freq_khz: u32, tsid: u16) -> io::Result<()> {
-    let req = tuner::ChangeChannelRequest {
-        oid: oid.fetch_add(1, Ordering::Relaxed),
-        tune: tuner::TUNE_CHANNEL_CHANGE,
-        not_decode: 0,
-        // Any service id is fine: nothing will be found at this frequency.
-        service_id: 141,
-        freq_khz,
-        tlv_stream_id: tsid,
-        bid: 1,
-    };
-    let t = tuner::Tuner::open_qid(tuner::ADSB_COMM_QID, tuner::MSGH_LIST)?;
-    eprintln!("mkra: idle — parking the tuner at {freq_khz} kHz / TSID {tsid:#06x}");
-    t.change_channel(&req)
 }
 
 /// Read the XCode6 chip temperature (ioctl 0x64, read-only).
@@ -4778,4 +4723,43 @@ fn cmd_tune(opts: &Options) -> i32 {
             1
         }
     }
+}
+
+fn cmd_latm2adts(opts: &Options) -> i32 {
+    let (Some(input), Some(output)) = (opts.file.as_deref(), opts.out.as_deref()) else {
+        eprintln!("mkra: latm2adts needs --file <in.ts> and --out <out.ts>");
+        return 2;
+    };
+    let data = match std::fs::read(input) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("mkra: read {input}: {e}");
+            return 1;
+        }
+    };
+    let start = match (0..188.min(data.len())).find(|&i| {
+        (0..3).all(|k| data.get(i + k * 188) == Some(&0x47))
+    }) {
+        Some(s) => s,
+        None => {
+            eprintln!("mkra: {input}: no 188-byte TS framing found");
+            return 1;
+        }
+    };
+    let whole = (data.len() - start) / 188 * 188;
+    let mut rw = latm::AdtsRewriter::new();
+    let mut out = Vec::with_capacity(data.len() + data.len() / 50);
+    rw.process(&data[start..start + whole], &mut out);
+    if let Err(e) = std::fs::write(output, &out) {
+        eprintln!("mkra: write {output}: {e}");
+        return 1;
+    }
+    println!(
+        "latm2adts: {} PES converted, {} passed through, {} AAC frames, {} errors -> {output}",
+        rw.pes_converted,
+        rw.pes_passed,
+        rw.frames(),
+        rw.errors()
+    );
+    if rw.pes_converted > 0 { 0 } else { 1 }
 }
