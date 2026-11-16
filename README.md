@@ -53,6 +53,8 @@ chmod 755 /tmp/mt/mkra
 
 BS朝日以外の通常BS5局も使う場合は、`config/bs-additional-main.tsv`を転送し、`--isdbs-channels /tmp/mt/bs-additional-main.tsv`を追加します。本体待機を使う場合は[電源制御](tools/contrib/power/README.md)のモジュールが必要です。
 
+CS110 を試す場合は、同じTSVに `type=CS`、`network_id=6` または `7` の行を追加します（`channel` 列のキーは `ND02` など）。周波数とTSIDは実測値が必要で、このForkはCS受信を検証していません。受信できない場合は[制限事項](docs/LIMITATIONS.md)を先に確認してください。
+
 ```sh
 curl http://198.51.100.10:40772/api/services
 curl http://198.51.100.10:40772/api/services/400151/stream -o test.ts

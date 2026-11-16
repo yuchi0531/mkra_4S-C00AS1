@@ -40,7 +40,7 @@ ls -l /tmp/bdh_out_msgh.lst
 
 既存mkraが稼働中なら、実行ファイル・引数・録画状態を確認して保守時間を取り、所有者の運用手順で切り替える。純正プロセスや未知PIDのkill、実行中バイナリの上書きはしない。
 
-`tools/deploy.py --smoke/--serve`は本家4K中心の配備・試験ツールで、通常BS6局込みの統合版を自動設定するものではない。新規統合配置はここで示す起動、または[manifest付きbundle](MKRA-AUTO-RESTORE.ja.md)を使う。
+`tools/deploy.py --smoke/--serve`は本家4K中心の配備・試験ツールで、通常BS6局込みの統合版を自動設定するものではない。新規統合配置はここで示す起動、または[manifest付きbundle](MKRA-AUTO-RESTORE.ja.md)を使う。通常BS/CSをtelnetだけで配置・実測する場合は `--bs2k --serve` または `--smoke-2k <serviceId>` を使えるが、選局により本体の表示が変わる。
 
 ## 4. 統合起動
 
